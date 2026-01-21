@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ubq"
+version = "0.1.0"
+description = "Bounds-based uncertainty helper tools for lab notebooks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ali Ozer" }]
+
+# IMPORTANT:
+# Only list dependencies that are pure-Python and that you know work under micropip.
+# DO NOT list numpy/matplotlib here unless you are certain your Teams kernel supports them via micropip.
+dependencies = [
+  "Pint==0.24.4",
+  "mpmath"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ubq"]
