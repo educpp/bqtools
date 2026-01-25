@@ -136,6 +136,10 @@ def sigfigs_from_str(s: str) -> int:
     mant = mant.strip().lstrip("+").lstrip("-")
     if mant in ("", "."):
         return 1
+    # Special case: zero value -> count total digits (excluding decimal point)
+    if set(mant.replace(".", "")) <= {"0"}:
+        digits = mant.replace(".", "")
+        return max(1, len(digits))
     if "." in mant:
         digits = mant.replace(".", "").lstrip("0")
         return max(1, len(digits))
@@ -351,6 +355,17 @@ class BoundedQuantity:
         if self.rule_mode == "place":
             return self.rule_place
         return place_from_val_sig(mid if mid != 0 else 1.0, self.rule_sig)
+
+    def __str__(self) -> str:
+        mid, u, _lo, _hi = iv_mid_half(self.I)
+        place = self.rule_place if self.rule_mode == "place" else place_from_val_sig(mid if mid != 0 else 1.0, self.rule_sig)
+        mid_s = fmt_place(mid, place)
+        u_s = fmt_place(u, place)
+        unit_s = unit_str(self.unit)
+        return f"{mid_s}, {u_s}, {unit_s}" if unit_s else f"{mid_s}, {u_s}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
 
     def __add__(self, other: Any) -> "BoundedQuantity":
         o = self._coerce(other)
@@ -815,6 +830,89 @@ class BQColumn:
         self._store[self._key(i)] = value
 
 
+class BQListView:
+    """Read-only view for a list of BoundedQuantity items with table-like printing."""
+
+    def __init__(self, items: List[BoundedQuantity], name: str = "y"):
+        self._items = items
+        self._col_widths = (3, 7, 7, 6)
+        self._name = (name or "y").strip() or "y"
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __getitem__(self, idx: Union[int, slice]) -> Any:
+        return self._items[idx]
+
+    def _binary_op(self, other: Any, op) -> List[BoundedQuantity]:
+        if isinstance(other, BQListView):
+            other_items = other._items
+        elif isinstance(other, list):
+            other_items = other
+        else:
+            other_items = None
+
+        if other_items is None:
+            return [op(a, other) for a in self._items]
+
+        if len(other_items) != len(self._items):
+            raise ValueError("List lengths must match for element-wise operations.")
+        return [op(a, b) for a, b in zip(self._items, other_items)]
+
+    def __add__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: a + b)
+
+    def __radd__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: b + a)
+
+    def __sub__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: a - b)
+
+    def __rsub__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: b - a)
+
+    def __mul__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: a * b)
+
+    def __rmul__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: b * a)
+
+    def __truediv__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: a / b)
+
+    def __rtruediv__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: b / a)
+
+    def __pow__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: a ** b)
+
+    def __rpow__(self, other: Any) -> List[BoundedQuantity]:
+        return self._binary_op(other, lambda a, b: b ** a)
+
+    def _format_row(self, q: BoundedQuantity, idx: int) -> str:
+        mid, u, _lo, _hi = iv_mid_half(q.I)
+        place = q.rule_place if q.rule_mode == "place" else place_from_val_sig(mid if mid != 0 else 1.0, q.rule_sig)
+        mid_s = fmt_place(mid, place)
+        u_s = fmt_place(u, place)
+        unit_s = unit_str(q.unit)
+        w_idx, w0, w1, w2 = self._col_widths
+        if not unit_s:
+            unit_s = ""
+        return f"{idx:>{w_idx}} | {mid_s:>{w0}} | {u_s:>{w1}} | {unit_s:<{w2}}"
+
+    def __str__(self) -> str:
+        w_idx, w0, w1, w2 = self._col_widths
+        header = f"{'#':>{w_idx}} | {self._name:>{w0}} | {'±':>{w1}} | {'unit':<{w2}}"
+        rows = "\n".join(self._format_row(q, i) for i, q in enumerate(self._items))
+        return f"{header}\n{rows}\n" if rows else f"{header}\n"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
 class Cols:
     """
     Storage for plot-ready lists prepared from DATA/CALC/CONST.
@@ -858,6 +956,11 @@ class BQStore:
       DATA["y_0"] = ("12.4","0.3","cm")
       DATA.y_0 is the same object.
 
+            Reassigning the same key turns it into an indexed list:
+            DATA["y"] = ("12.4","0.3","cm")
+            DATA["y"] = ("12.6","0.3","cm")
+            DATA.y  -> [y_0, y_1]
+
     Column access:
       DATA.y[0] = ("12.4","0.3","cm")
       DATA.y[0] is the same as DATA["y_0"].
@@ -879,19 +982,108 @@ class BQStore:
     def clear(self) -> None:
         """Remove all stored quantities and unregister their symbols."""
         for k in list(self._store.keys()):
-            _unregister_symbol(k)
+            v = self._store.get(k)
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, BoundedQuantity) and item.symbol.strip():
+                        _unregister_symbol(item.symbol)
+            else:
+                _unregister_symbol(k)
         self._store.clear()
         self.cols.clear()
+
+    def _store_list(self, key: str, items: List[BoundedQuantity]) -> None:
+        if key in self._store:
+            old = self._store.get(key)
+            if isinstance(old, list):
+                for item in old:
+                    if isinstance(item, BoundedQuantity) and item.symbol.strip():
+                        _unregister_symbol(item.symbol)
+            else:
+                _unregister_symbol(key)
+
+        for i, q in enumerate(items):
+            q.set_symbol(f"{key}_{i}")
+        self._store[key] = items
 
     def keys(self) -> List[str]:
         """Return stored keys in insertion order."""
         return list(self._store.keys())
 
     def __contains__(self, key: str) -> bool:
-        return key in self._store
+        if key in self._store:
+            return True
+        base, idx = self._split_indexed_key(key)
+        if base and idx is not None:
+            v = self._store.get(base)
+            return isinstance(v, list) and 0 <= idx < len(v)
+        return False
 
-    def __getitem__(self, key: str) -> BoundedQuantity:
-        return self._store[key]
+    def __getitem__(self, key: str) -> Any:
+        if key in self._store:
+            v = self._store[key]
+            return BQListView(v, name=key) if isinstance(v, list) else v
+        base, idx = self._split_indexed_key(key)
+        if base and idx is not None:
+            v = self._store.get(base)
+            if isinstance(v, list) and 0 <= idx < len(v):
+                return v[idx]
+        raise KeyError(key)
+
+    def _coerce_to_bq(self, k: str, value: Any, *, symbol: str) -> BoundedQuantity:
+        if isinstance(value, tuple):
+            if len(value) != 3:
+                raise ValueError(f"{self._name}[{k!r}] tuple must be (value, bound, unit).")
+            return Qb(value, symbol=symbol)
+
+        if isinstance(value, BoundedQuantity):
+            return value.set_symbol(symbol) if value.symbol.strip() != symbol else value
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return BoundedQuantity.const(float(value)).set_symbol(symbol)
+
+        raise TypeError(
+            f"{self._name}[{k!r}] expects a (value, bound, unit) tuple or a BoundedQuantity expression."
+        )
+
+    def _coerce_to_bq_with_prev(
+        self, k: str, value: Any, *, symbol: str, prev: BoundedQuantity
+    ) -> BoundedQuantity:
+        if isinstance(value, tuple):
+            if len(value) == 1:
+                v = value[0]
+                b = None
+            elif len(value) == 3:
+                return self._coerce_to_bq(k, value, symbol=symbol)
+            elif len(value) == 2:
+                v, b = value
+            else:
+                raise ValueError(
+                    f"{self._name}[{k!r}] tuple must be (value, bound, unit) or (value,) for copy-forward."
+                )
+        elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            v = value
+            b = None
+        else:
+            return self._coerce_to_bq(k, value, symbol=symbol)
+
+        mid_prev, u_prev, _lo, _hi = iv_mid_half(prev.I)
+        place = prev.rule_place if prev.rule_mode == "place" else place_from_val_sig(
+            mid_prev if mid_prev != 0 else 1.0, prev.rule_sig
+        )
+        u_str = fmt_place(u_prev, place) if b is None else str(b)
+        unit_s = unit_str(prev.unit)
+        return Qb((v, u_str, unit_s), symbol=symbol)
+
+    def _split_indexed_key(self, key: str) -> Tuple[Optional[str], Optional[int]]:
+        k = (key or "").strip()
+        m = re.match(r"^(?P<base>.+)_(?P<idx>\d+)$", k)
+        if not m:
+            return None, None
+        base = m.group("base")
+        if not base.isidentifier():
+            return None, None
+        return base, int(m.group("idx"))
 
     def __setitem__(self, key: str, value: Any) -> None:
         k = (key or "").strip()
@@ -900,32 +1092,55 @@ class BQStore:
         if not k.isidentifier():
             raise ValueError(f"{self._name}[{k!r}]: key must be a valid identifier (example: 'y_0', 'l_1').")
 
-        if k in self._store:
-            _unregister_symbol(k)
-            self._store.pop(k, None)
-
-        if isinstance(value, tuple):
-            if len(value) != 3:
-                raise ValueError(f"{self._name}[{k!r}] tuple must be (value, bound, unit).")
-            q = Qb(value, symbol=k)
-            self._store[k] = q
+        if isinstance(value, BQListView):
+            self._store_list(k, list(value))
+            return
+        if isinstance(value, list) and all(isinstance(v, BoundedQuantity) for v in value):
+            self._store_list(k, value)
             return
 
-        if isinstance(value, BoundedQuantity):
-            q = value.set_symbol(k) if value.symbol.strip() != k else value
-            self._store[k] = q
+        base, idx = self._split_indexed_key(k)
+        if base and idx is not None:
+            existing_base = self._store.get(base)
+            if isinstance(existing_base, list):
+                if idx < len(existing_base):
+                    _unregister_symbol(existing_base[idx].symbol)
+                    existing_base[idx] = self._coerce_to_bq(k, value, symbol=f"{base}_{idx}")
+                    return
+                if idx == len(existing_base):
+                    existing_base.append(self._coerce_to_bq(k, value, symbol=f"{base}_{idx}"))
+                    return
+                raise IndexError(f"{self._name}[{k!r}] index {idx} is out of range.")
+
+        if k not in self._store:
+            self._store[k] = self._coerce_to_bq(k, value, symbol=k)
             return
 
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            q = BoundedQuantity.const(float(value)).set_symbol(k)
-            self._store[k] = q
+        existing = self._store.get(k)
+        if isinstance(existing, list):
+            idx = len(existing)
+            q = self._coerce_to_bq_with_prev(k, value, symbol=f"{k}_{idx}", prev=existing[0])
+            existing.append(q)
+            return
+
+        if isinstance(existing, BoundedQuantity):
+            _unregister_symbol(existing.symbol)
+            existing.set_symbol(f"{k}_0")
+            q = self._coerce_to_bq_with_prev(k, value, symbol=f"{k}_1", prev=existing)
+            self._store[k] = [existing, q]
             return
 
         raise TypeError(f"{self._name}[{k!r}] expects a (value, bound, unit) tuple or a BoundedQuantity expression.")
 
     def __getattr__(self, name: str) -> Any:
         if name in self._store:
-            return self._store[name]
+            v = self._store[name]
+            return BQListView(v, name=name) if isinstance(v, list) else v
+        base, idx = self._split_indexed_key(name)
+        if base and idx is not None:
+            v = self._store.get(base)
+            if isinstance(v, list) and 0 <= idx < len(v):
+                return v[idx]
         if name.startswith("_"):
             raise AttributeError(name)
         return BQColumn(self, name)
@@ -951,6 +1166,9 @@ class BQStore:
             m = pat.match(k)
             if m:
                 out.append((int(m.group(1)), k))
+        if p in self._store and isinstance(self._store[p], list):
+            for i, _q in enumerate(self._store[p]):
+                out.append((i, f"{p}_{i}"))
         out.sort(key=lambda t: t[0])
         return out
 
@@ -988,7 +1206,16 @@ class BQStore:
         out_unit: Optional[pint.Unit] = None
 
         for i, k in items:
-            q = self._store[k]
+            if k in self._store:
+                q = self._store[k]
+            else:
+                base, idx = self._split_indexed_key(k)
+                if base is None or idx is None:
+                    raise KeyError(k)
+                v = self._store.get(base)
+                if not isinstance(v, list) or idx >= len(v):
+                    raise KeyError(k)
+                q = v[idx]
             mid, u, _lo, _hi = iv_mid_half(q.I)
 
             if tgt_unit is None:
