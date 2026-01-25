@@ -194,7 +194,6 @@ def sigfigs_from_str(s: str) -> int:
     mant = mant.strip().lstrip("+").lstrip("-")
     if mant in ("", "."):
         return 1
-    # Special case: zero value -> count total digits (excluding decimal point)
     if set(mant.replace(".", "")) <= {"0"}:
         digits = mant.replace(".", "")
         return max(1, len(digits))
