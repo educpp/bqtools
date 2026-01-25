@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ubq"
-version = "0.1.0"
+version = "0.1.1"
 description = "Bounds-based uncertainty helper tools for lab notebooks"
 readme = "README.md"
 requires-python = ">=3.10"

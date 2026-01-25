@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import math
 import re
+import warnings
 from mpmath import iv
 import pint
 
@@ -11,6 +12,63 @@ TupleInput = Tuple[StrOrNum, StrOrNum, str]
 
 _SYMBOL_TO_OBJ: Dict[str, int] = {}
 _OBJ_TO_SYMBOL: Dict[int, str] = {}
+_AUTO_STORES: Dict[str, "BQStore"] = {}
+_INJECTED_KEY_TARGETS: Dict[str, Tuple[str, str]] = {}
+
+
+def _inject_global(name: str, value: Any) -> None:
+    try:
+        try:
+            from IPython import get_ipython
+
+            ip = get_ipython()
+        except Exception:
+            ip = None
+
+        if ip is not None and hasattr(ip, "user_ns"):
+            g = ip.user_ns
+        else:
+            import inspect
+
+            frame = inspect.currentframe()
+            caller = frame.f_back.f_back if frame and frame.f_back else None
+            if caller is None:
+                return
+            g = caller.f_globals
+        if name in g and g[name] is not value:
+            existing = g.get(name)
+
+            def _is_bq_obj(v: Any) -> bool:
+                for cls_name in ("BQStore", "BQKeyView", "BQListView", "BoundedQuantity"):
+                    cls = globals().get(cls_name)
+                    if cls is not None and isinstance(v, cls):
+                        return True
+                return False
+
+            if _is_bq_obj(existing) and _is_bq_obj(value):
+                g[name] = value
+                return
+
+            warnings.warn(
+                f"Global '{name}' already exists. Use del {name} (or restart the kernel) and re-run.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        g[name] = value
+    finally:
+        try:
+            del frame
+        except Exception:
+            pass
+
+
+def _register_injected_key(store: "BQStore", key: str) -> None:
+    _INJECTED_KEY_TARGETS[key] = (store._name, key)
+
+
+def get_injected_target(name: str) -> Optional[Tuple[str, str]]:
+    return _INJECTED_KEY_TARGETS.get(name)
 
 
 def reset_symbol_registry() -> None:
@@ -368,6 +426,8 @@ class BoundedQuantity:
         return self.__str__()
 
     def __add__(self, other: Any) -> "BoundedQuantity":
+        if "BQListView" in globals() and isinstance(other, (BQListView, BQKeyView)):
+            return NotImplemented
         o = self._coerce(other)
         oI = iv_convert(o.I, o.unit, self.unit)
         I = self.I + oI
@@ -387,6 +447,8 @@ class BoundedQuantity:
         )
 
     def __sub__(self, other: Any) -> "BoundedQuantity":
+        if "BQListView" in globals() and isinstance(other, (BQListView, BQKeyView)):
+            return NotImplemented
         o = self._coerce(other)
         oI = iv_convert(o.I, o.unit, self.unit)
         I = self.I - oI
@@ -406,6 +468,8 @@ class BoundedQuantity:
         )
 
     def __mul__(self, other: Any) -> "BoundedQuantity":
+        if "BQListView" in globals() and isinstance(other, (BQListView, BQKeyView)):
+            return NotImplemented
         o = self._coerce(other)
         I = self.I * o.I
         unit = self.unit * o.unit
@@ -434,6 +498,8 @@ class BoundedQuantity:
         )
 
     def __truediv__(self, other: Any) -> "BoundedQuantity":
+        if "BQListView" in globals() and isinstance(other, (BQListView, BQKeyView)):
+            return NotImplemented
         o = self._coerce(other)
         I = self.I / o.I
         unit = self.unit / o.unit
@@ -850,6 +916,8 @@ class BQListView:
     def _binary_op(self, other: Any, op) -> List[BoundedQuantity]:
         if isinstance(other, BQListView):
             other_items = other._items
+        elif "BQKeyView" in globals() and isinstance(other, BQKeyView):
+            other_items = other._items()
         elif isinstance(other, list):
             other_items = other
         else:
@@ -911,6 +979,68 @@ class BQListView:
 
     def __repr__(self) -> str:
         return self.__str__()
+
+
+class BQKeyView:
+    """View for a single key that prints as a table and supports list-like ops."""
+
+    def __init__(self, store: "BQStore", key: str):
+        self._store = store
+        self._key = (key or "").strip()
+
+    def _items(self) -> List[BoundedQuantity]:
+        v = self._store._store.get(self._key)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, BoundedQuantity):
+            return [v]
+        return []
+
+    def __len__(self) -> int:
+        return len(self._items())
+
+    def __iter__(self):
+        return iter(self._items())
+
+    def __getitem__(self, idx: Union[int, slice]) -> Any:
+        items = self._items()
+        return items[idx]
+
+    def __str__(self) -> str:
+        return str(BQListView(self._items(), name=self._key))
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    def __add__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__add__(other)
+
+    def __radd__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__radd__(other)
+
+    def __sub__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__sub__(other)
+
+    def __rsub__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__rsub__(other)
+
+    def __mul__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__mul__(other)
+
+    def __rmul__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__rmul__(other)
+
+    def __truediv__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__truediv__(other)
+
+    def __rtruediv__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__rtruediv__(other)
+
+    def __pow__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__pow__(other)
+
+    def __rpow__(self, other: Any) -> List[BoundedQuantity]:
+        return BQListView(self._items(), name=self._key).__rpow__(other)
 
 
 class Cols:
@@ -1005,6 +1135,14 @@ class BQStore:
         for i, q in enumerate(items):
             q.set_symbol(f"{key}_{i}")
         self._store[key] = items
+        if len(items) == 1:
+            _inject_global(key, items[0])
+            _inject_global(f"{key}_0", items[0])
+        else:
+            _inject_global(key, BQKeyView(self, key))
+            for i, q in enumerate(items):
+                _inject_global(f"{key}_{i}", q)
+        _register_injected_key(self, key)
 
     def keys(self) -> List[str]:
         """Return stored keys in insertion order."""
@@ -1114,6 +1252,9 @@ class BQStore:
 
         if k not in self._store:
             self._store[k] = self._coerce_to_bq(k, value, symbol=k)
+            _inject_global(k, self._store[k])
+            _inject_global(f"{k}_0", self._store[k])
+            _register_injected_key(self, k)
             return
 
         existing = self._store.get(k)
@@ -1121,6 +1262,7 @@ class BQStore:
             idx = len(existing)
             q = self._coerce_to_bq_with_prev(k, value, symbol=f"{k}_{idx}", prev=existing[0])
             existing.append(q)
+            _inject_global(f"{k}_{idx}", q)
             return
 
         if isinstance(existing, BoundedQuantity):
@@ -1128,6 +1270,10 @@ class BQStore:
             existing.set_symbol(f"{k}_0")
             q = self._coerce_to_bq_with_prev(k, value, symbol=f"{k}_1", prev=existing)
             self._store[k] = [existing, q]
+            _inject_global(k, BQKeyView(self, k))
+            _inject_global(f"{k}_0", existing)
+            _inject_global(f"{k}_1", q)
+            _register_injected_key(self, k)
             return
 
         raise TypeError(f"{self._name}[{k!r}] expects a (value, bound, unit) tuple or a BoundedQuantity expression.")
@@ -1244,7 +1390,44 @@ def reset_all() -> None:
     DATA.clear()
     CALC.clear()
     CONST.clear()
+    for k, store in list(_AUTO_STORES.items()):
+        store.clear()
+        _AUTO_STORES.pop(k, None)
+    try:
+        from IPython import get_ipython
+
+        ip = get_ipython()
+    except Exception:
+        ip = None
+    if ip is not None and hasattr(ip, "user_ns"):
+        ns = ip.user_ns
+        for name in list(ns.keys()):
+            if name in ("DATA", "CALC", "CONST"):
+                continue
+            v = ns.get(name)
+            if isinstance(v, BQStore) or isinstance(v, BQKeyView) or isinstance(v, BoundedQuantity):
+                ns.pop(name, None)
+    _INJECTED_KEY_TARGETS.clear()
     reset_symbol_registry()
+
+
+def make_store(name: str) -> BQStore:
+    """Create a new BQStore instance (e.g., ELONGATION = make_store("ELONGATION"))."""
+    return BQStore(name)
+
+
+def get_or_create_store(name: str) -> BQStore:
+    """Get or create a named BQStore for auto-created globals (uppercase names only)."""
+    n = (name or "").strip()
+    if not n or not n.isidentifier() or not n.isupper():
+        raise AttributeError(name)
+    if n in ("DATA", "CALC", "CONST"):
+        return globals()[n]
+    if n not in _AUTO_STORES:
+        _AUTO_STORES[n] = BQStore(n)
+    return _AUTO_STORES[n]
+
+
 
 
 DATA = BQStore("DATA")
